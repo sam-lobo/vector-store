@@ -9,6 +9,7 @@ import uuid
 import time
 import threading
 from typing import List, Optional
+import os
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins
@@ -142,4 +143,5 @@ cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
 cleanup_thread.start()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
