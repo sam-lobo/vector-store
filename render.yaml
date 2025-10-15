@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: flask-vector-service
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: ENV
+        value: production
