@@ -1,0 +1,7 @@
+flask
+flask-cors
+pydantic
+sentence-transformers
+faiss-cpu
+numpy
+tiktoken
