@@ -14,9 +14,9 @@ import os
 app = Flask(__name__)
 CORS(app)  # Allow all origins
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L3-v2")
 
-SESSION_TIMEOUT = 600  # 10 minutes
+SESSION_TIMEOUT = 1800  # 30 minutes
 user_sessions = {}
 
 class TextInput(BaseModel):
@@ -136,7 +136,7 @@ def cleanup_sessions():
         for user_id in expired_users:
             del user_sessions[user_id]
             print(f"Session '{user_id}' expired and deleted.")
-        time.sleep(240)  # Check every 4 minutes
+        time.sleep(600)  # Check every 10 minutes
 
 # Start background session cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
