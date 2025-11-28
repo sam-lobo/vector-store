@@ -26,7 +26,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Optional: rotating file log (works on Render too)
+# rotating file log (works on Render)
 handler = RotatingFileHandler("server.log", maxBytes=1_000_000, backupCount=5)
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 app.logger.addHandler(handler)
@@ -35,27 +35,33 @@ app.logger.info("🚀 Flask service starting...")
 
 
 # -----------------------------------
-# NOMIC CLOUD EMBEDDINGS
+# NOMIC CLOUD EMBEDDINGS (CORRECT AUTH)
 # -----------------------------------
 NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 
 def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
-    app.logger.info(f"📡 Sending request to Nomic API with {len(texts)} text chunks.")
-
-    payload = {
-        "apiKey": api_key,
-        "texts": texts
+    """
+    Calls Nomic Embedding API to generate embeddings.
+    API key must be sent in Authorization header (Bearer).
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
     }
+
+    body = {"texts": texts}
+
+    app.logger.info(f"📡 Sending embedding request to Nomic ({len(texts)} chunks)")
 
     try:
         response = requests.post(
             NOMIC_URL,
-            headers={"Content-Type": "application/json"},
-            json=payload,
+            headers=headers,
+            json=body,
             timeout=30
         )
     except Exception as e:
-        app.logger.error("❌ Error calling Nomic API:")
+        app.logger.error("❌ Request error calling Nomic API:")
         app.logger.error(str(e))
         raise
 
@@ -68,15 +74,14 @@ def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
     data = response.json()
 
     if "embeddings" not in data:
-        app.logger.error(f"❌ Missing 'embeddings' in Nomic response: {data}")
-        raise Exception("Malformed Nomic API response: missing embeddings")
+        app.logger.error(f"❌ Missing embeddings in Nomic response: {data}")
+        raise Exception("Malformed Nomic API response: no embeddings")
 
     embeds = np.array(data["embeddings"], dtype=np.float32)
-
     if embeds.ndim == 1:
         embeds = np.expand_dims(embeds, axis=0)
 
-    app.logger.info("✅ Successfully received embeddings from Nomic.")
+    app.logger.info("✅ Embeddings received successfully.")
     return embeds
 
 
@@ -105,16 +110,18 @@ class DeleteSessionInput(BaseModel):
 # TEXT CHUNKING
 # -----------------------------------
 def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]:
-    app.logger.info("✂️ Chunking input text.")
+    app.logger.info("✂️ Chunking text...")
     encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
     chunks = []
+
     i = 0
     while i < len(tokens):
         chunk = tokens[i : i + chunk_size]
         chunks.append(encoding.decode(chunk))
         i += chunk_size - overlap
-    app.logger.info(f"📦 Created {len(chunks)} chunks.")
+
+    app.logger.info(f"📦 Total chunks created: {len(chunks)}")
     return chunks
 
 
@@ -124,21 +131,20 @@ def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]
 @app.route('/initialize', methods=['POST'])
 def build_vector_store():
     try:
-        app.logger.info("📥 /initialize request received.")
-        app.logger.info(f"Raw request JSON: {request.json}")
+        app.logger.info("📥 /initialize request received")
+        app.logger.info(f"Request JSON: {request.json}")
 
         payload = TextInput(**request.json)
     except ValidationError as e:
-        app.logger.error("❌ Validation error in /initialize:")
-        app.logger.error(str(e))
+        app.logger.error("❌ Validation error in /initialize")
         return jsonify({'error': e.errors()}), 400
-    except Exception as e:
-        app.logger.error("❌ Unexpected error parsing /initialize request:")
+    except Exception:
+        app.logger.error("❌ Unexpected error in /initialize")
         app.logger.error(traceback.format_exc())
-        return jsonify({'error': 'Invalid request format'}), 400
+        return jsonify({'error': 'Invalid request'}), 400
 
     user_id = payload.user_id or str(uuid.uuid4())
-    app.logger.info(f"🆔 Initializing session for user_id: {user_id}")
+    app.logger.info(f"🆔 Creating new session: {user_id}")
 
     try:
         text_chunks = chunk_text(payload.text)
@@ -155,15 +161,15 @@ def build_vector_store():
             "last_accessed": time.time(),
         }
 
-        app.logger.info(f"✅ Session {user_id} created with {len(text_chunks)} chunks.")
-
+        app.logger.info(f"✅ Session {user_id} initialized successfully.")
         return jsonify({
             "status": "success",
             "user_id": user_id,
             "chunks_stored": len(text_chunks)
         })
+
     except Exception as e:
-        app.logger.error("❌ Error during /initialize execution:")
+        app.logger.error("❌ Error in /initialize:")
         app.logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
@@ -174,21 +180,19 @@ def build_vector_store():
 @app.route('/query_vector_store', methods=['POST'])
 def query_vector_store():
     try:
-        app.logger.info("📥 /query_vector_store request received.")
-        app.logger.info(f"Raw request JSON: {request.json}")
+        app.logger.info("📥 /query_vector_store request received")
+        app.logger.info(f"Request JSON: {request.json}")
 
         payload = QueryInput(**request.json)
     except ValidationError as e:
-        app.logger.error("❌ Validation error in /query_vector_store:")
-        app.logger.error(str(e))
+        app.logger.error("❌ Validation error in query")
         return jsonify({'error': e.errors()}), 400
-    except Exception as e:
-        app.logger.error("❌ Unexpected error parsing request:")
-        app.logger.error(traceback.format_exc())
-        return jsonify({'error': 'Invalid request format'}), 400
+    except Exception:
+        app.logger.error("❌ Unexpected error parsing request")
+        return jsonify({'error': 'Invalid request'}), 400
 
     if payload.user_id not in user_sessions:
-        app.logger.warning(f"⚠️ User session not found: {payload.user_id}")
+        app.logger.warning(f"⚠️ Missing session: {payload.user_id}")
         return jsonify({"error": "User session not found"}), 404
 
     session = user_sessions[payload.user_id]
@@ -196,22 +200,23 @@ def query_vector_store():
     try:
         query_embedding = get_cloud_embedding([payload.query], payload.api_key)[0]
 
-        vector_index = session["index"]
-        text_chunks = session["chunks"]
+        index = session["index"]
+        chunks = session["chunks"]
 
-        D, I = vector_index.search(
+        D, I = index.search(
             np.array([query_embedding], dtype=np.float32),
             payload.top_k
         )
 
-        results = [text_chunks[idx] for idx in I[0] if idx < len(text_chunks)]
+        results = [chunks[idx] for idx in I[0] if idx < len(chunks)]
+
         session["last_accessed"] = time.time()
 
-        app.logger.info(f"🔍 Returned {len(results)} matches for user {payload.user_id}")
-
+        app.logger.info(f"🔍 Query success for user {payload.user_id}")
         return jsonify({"matches": results})
+
     except Exception as e:
-        app.logger.error("❌ Error during /query_vector_store execution:")
+        app.logger.error("❌ Error in /query_vector_store")
         app.logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
@@ -228,10 +233,9 @@ def delete_session():
 
     if payload.user_id in user_sessions:
         del user_sessions[payload.user_id]
-        app.logger.info(f"🗑️ Session deleted: {payload.user_id}")
+        app.logger.info(f"🗑️ Deleted session {payload.user_id}")
         return jsonify({"status": "success"})
 
-    app.logger.warning(f"⚠️ Tried to delete missing session: {payload.user_id}")
     return jsonify({"error": "User session not found"}), 404
 
 
@@ -247,14 +251,14 @@ def cleanup_sessions():
         ]
         for uid in expired:
             del user_sessions[uid]
-            app.logger.info(f"🧹 Session expired and deleted: {uid}")
+            app.logger.info(f"🧹 Auto-deleted expired session {uid}")
         time.sleep(600)
 
 threading.Thread(target=cleanup_sessions, daemon=True).start()
 
 
 # -----------------------------------
-# START FLASK WITH RENDER PORT
+# START FLASK USING RENDER PORT
 # -----------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
