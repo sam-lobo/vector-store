@@ -1,0 +1,189 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pydantic import BaseModel, ValidationError
+import faiss
+import numpy as np
+import tiktoken
+import uuid
+import time
+import threading
+from typing import List, Optional
+import requests
+import os
+
+app = Flask(__name__)
+CORS(app)
+
+# ----------------------
+# NOMIC CLOUD EMBEDDINGS
+# ----------------------
+NOMIC_API_KEY = os.getenv("NOMIC_API_KEY")
+NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
+
+def get_cloud_embedding(texts: List[str]) -> np.ndarray:
+    """
+    Calls Nomic Embedding API to generate embeddings.
+    Expecting 1024-d vectors.
+    """
+    response = requests.post(
+        NOMIC_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NOMIC_API_KEY}"
+        },
+        json={"texts": texts}
+    )
+
+    if response.status_code != 200:
+        raise Exception(f"Nomic API Error: {response.status_code} {response.text}")
+
+    data = response.json()
+    embeds = np.array(data["embeddings"], dtype=np.float32)
+
+    # Ensure batch dimension
+    if embeds.ndim == 1:
+        embeds = np.expand_dims(embeds, axis=0)
+
+    return embeds
+
+
+# -----------------------
+# USER SESSIONS & CONFIG
+# -----------------------
+SESSION_TIMEOUT = 1800  # 30 minutes
+user_sessions = {}
+
+class TextInput(BaseModel):
+    text: str
+    user_id: Optional[str] = None
+
+class QueryInput(BaseModel):
+    query: str
+    top_k: int = 5
+    user_id: str
+
+class DeleteSessionInput(BaseModel):
+    user_id: str
+
+
+# -----------------------
+# TEXT CHUNKING FUNCTION
+# -----------------------
+def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]:
+    encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode(text)
+    chunks = []
+    i = 0
+    while i < len(tokens):
+        chunk = tokens[i : i + chunk_size]
+        chunks.append(encoding.decode(chunk))
+        i += chunk_size - overlap
+    return chunks
+
+
+# -----------------------
+# INITIALIZE VECTOR STORE
+# -----------------------
+@app.route('/initialize', methods=['POST'])
+def build_vector_store():
+    try:
+        payload = TextInput(**request.json)
+    except ValidationError as e:
+        return jsonify({'error': e.errors()}), 400
+
+    user_id = payload.user_id or str(uuid.uuid4())
+    text_chunks = chunk_text(payload.text)
+
+    if not text_chunks:
+        return jsonify({"error": "No text chunks found after chunking."}), 400
+
+    # ---- NOMAC EMBEDDINGS ----
+    embeddings = get_cloud_embedding(text_chunks)
+
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+
+    user_sessions[user_id] = {
+        "index": index,
+        "chunks": text_chunks,
+        "last_accessed": time.time(),
+    }
+
+    return jsonify({
+        "status": "success",
+        "user_id": user_id,
+        "chunks_stored": len(text_chunks)
+    })
+
+
+# -----------------------
+# QUERY VECTOR STORE
+# -----------------------
+@app.route('/query_vector_store', methods=['POST'])
+def query_vector_store():
+    try:
+        payload = QueryInput(**request.json)
+    except ValidationError as e:
+        return jsonify({'error': e.errors()}), 400
+
+    user_id = payload.user_id
+    if user_id not in user_sessions:
+        return jsonify({"error": f"User session '{user_id}' not found."}), 404
+
+    session = user_sessions[user_id]
+    vector_index = session["index"]
+    text_chunks = session["chunks"]
+
+    # ---- NOMAC EMBEDDING ----
+    query_embedding = get_cloud_embedding([payload.query])[0]
+
+    D, I = vector_index.search(
+        np.array([query_embedding], dtype=np.float32), 
+        payload.top_k
+    )
+
+    results = []
+    for idx in I[0]:
+        if idx < len(text_chunks):
+            results.append(text_chunks[idx])
+
+    session["last_accessed"] = time.time()
+
+    return jsonify({"matches": results})
+
+
+# -----------------------
+# DELETE SESSION
+# -----------------------
+@app.route('/delete_session', methods=['POST'])
+def delete_session():
+    try:
+        payload = DeleteSessionInput(**request.json)
+    except ValidationError as e:
+        return jsonify({'error': e.errors()}), 400
+
+    if payload.user_id in user_sessions:
+        del user_sessions[payload.user_id]
+        return jsonify({"status": "success", "message": f"Session '{payload.user_id}' deleted."})
+
+    return jsonify({"error": f"User session '{payload.user_id}' not found."}), 404
+
+
+# -----------------------
+# CLEANUP EXPIRED SESSIONS
+# -----------------------
+def cleanup_sessions():
+    while True:
+        now = time.time()
+        expired_ids = [
+            uid for uid, session in user_sessions.items()
+            if now - session["last_accessed"] > SESSION_TIMEOUT
+        ]
+        for uid in expired_ids:
+            del user_sessions[uid]
+            print(f"Session '{uid}' expired and deleted.")
+
+        time.sleep(600)
+
+threading.Thread(target=cleanup_sessions, daemon=True).start()
