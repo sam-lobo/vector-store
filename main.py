@@ -13,7 +13,7 @@ import threading
 from typing import List, Optional
 import requests
 import os
-import pickle   # ⭐ ADDED
+import pickle 
 
 # -----------------------------------
 # FLASK + LOGGING CONFIGURATION
@@ -32,6 +32,7 @@ app.logger.addHandler(handler)
 
 app.logger.info("🚀 Flask service starting...")
 
+
 # -----------------------------------
 # EMBEDDING CACHE (SERVER-SIDE)
 # -----------------------------------
@@ -47,17 +48,18 @@ def save_cache():
     with open(CACHE_FILE, "wb") as f:
         pickle.dump(embedding_cache, f)
 
-app.logger.info(f"📚 Cache loaded with {len(embedding_cache)} items")
+app.logger.info(f"📚 Embedding cache loaded. Items: {len(embedding_cache)}")
+
 
 # -----------------------------------
-# NOMIC CLOUD EMBEDDINGS (WITH CACHE)
+# NOMIC API
 # -----------------------------------
 NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 
 def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
     """
-    Uses server-side cache to prevent repeated API calls.
-    Only fetches embeddings not already in cache.
+    Retrieves embeddings using cache first.
+    Only calls Nomic API for texts not in cache.
     """
     global embedding_cache
 
@@ -65,7 +67,7 @@ def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
     missing = []
     missing_idx = []
 
-    # 1. CHECK CACHE
+    # 1. Check cache
     for i, text in enumerate(texts):
         if text in embedding_cache:
             cached.append((i, embedding_cache[text]))
@@ -75,7 +77,7 @@ def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
 
     fetched = []
 
-    # 2. FETCH ONLY MISSING EMBEDDINGS
+    # 2. Fetch missing items from Nomic
     if missing:
         app.logger.info(f"📡 Fetching {len(missing)} embeddings from Nomic")
 
@@ -83,7 +85,7 @@ def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
             NOMIC_URL,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
+                "Authorization": f"Bearer {api_key}",
             },
             json={"texts": missing},
             timeout=30
@@ -95,22 +97,23 @@ def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
         data = response.json()
         fetched = data["embeddings"]
 
-        # SAVE NEW ITEMS TO CACHE
+        # Store fetched results in cache
         for idx, emb in zip(missing_idx, fetched):
             embedding_cache[texts[idx]] = np.array(emb, dtype=np.float32)
 
-        save_cache()  # persist to disk
+        save_cache()  # Persist cache
 
-    # 3. REBUILD ORDERED ARRAY
-    final = [None] * len(texts)
+    # 3. Build final ordered output
+    output = [None] * len(texts)
 
     for idx, emb in cached:
-        final[idx] = np.array(emb, dtype=np.float32)
+        output[idx] = np.array(emb, dtype=np.float32)
 
     for idx, emb in zip(missing_idx, fetched):
-        final[idx] = np.array(emb, dtype=np.float32)
+        output[idx] = np.array(emb, dtype=np.float32)
 
-    return np.vstack(final)
+    return np.vstack(output)
+
 
 # -----------------------------------
 # USER SESSION MODELS
@@ -132,6 +135,7 @@ class QueryInput(BaseModel):
 class DeleteSessionInput(BaseModel):
     user_id: str
 
+
 # -----------------------------------
 # TEXT CHUNKING
 # -----------------------------------
@@ -142,21 +146,26 @@ def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]
 
     i = 0
     while i < len(tokens):
-        chunk = tokens[i : i + chunk_size]
+        chunk = tokens[i:i+chunk_size]
         chunks.append(encoding.decode(chunk))
         i += chunk_size - overlap
 
     return chunks
+
 
 # -----------------------------------
 # INITIALIZE VECTOR STORE
 # -----------------------------------
 @app.route('/initialize', methods=['POST'])
 def build_vector_store():
-    payload = TextInput(**request.json)
-    user_id = payload.user_id or str(uuid.uuid4())
+    try:
+        payload = TextInput(**request.json)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
+    user_id = payload.user_id or str(uuid.uuid4())
     text_chunks = chunk_text(payload.text)
+
     embeddings = get_cloud_embedding(text_chunks, payload.api_key)
 
     dim = embeddings.shape[1]
@@ -169,14 +178,22 @@ def build_vector_store():
         "last_accessed": time.time(),
     }
 
-    return jsonify({"status": "success", "user_id": user_id})
+    return jsonify({
+        "status": "success",
+        "user_id": user_id,
+        "chunks_stored": len(text_chunks)
+    })
+
 
 # -----------------------------------
 # QUERY VECTOR STORE
 # -----------------------------------
 @app.route('/query_vector_store', methods=['POST'])
 def query_vector_store():
-    payload = QueryInput(**request.json)
+    try:
+        payload = QueryInput(**request.json)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
     if payload.user_id not in user_sessions:
         return jsonify({"error": "User session not found"}), 404
@@ -190,20 +207,26 @@ def query_vector_store():
         payload.top_k
     )
 
-    results = [session["chunks"][idx] for idx in I[0]]
+    results = [session["chunks"][idx] for idx in I[0] if idx < len(session["chunks"])]
 
     session["last_accessed"] = time.time()
 
     return jsonify({"matches": results})
+
 
 # -----------------------------------
 # DELETE SESSION
 # -----------------------------------
 @app.route('/delete_session', methods=['POST'])
 def delete_session():
-    payload = DeleteSessionInput(**request.json)
+    try:
+        payload = DeleteSessionInput(**request.json)
+    except:
+        return jsonify({"error": "Invalid request"}), 400
+
     user_sessions.pop(payload.user_id, None)
     return jsonify({"status": "success"})
+
 
 # -----------------------------------
 # CLEANUP THREAD
@@ -211,18 +234,19 @@ def delete_session():
 def cleanup_sessions():
     while True:
         now = time.time()
-        expired = [
-            uid for uid, s in user_sessions.items()
-            if now - s["last_accessed"] > SESSION_TIMEOUT
-        ]
+        expired = [uid for uid, s in user_sessions.items()
+                   if now - s["last_accessed"] > SESSION_TIMEOUT]
+
         for uid in expired:
             del user_sessions[uid]
+
         time.sleep(600)
 
 threading.Thread(target=cleanup_sessions, daemon=True).start()
 
+
 # -----------------------------------
-# START FLASK SERVER
+# START FLASK
 # -----------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
