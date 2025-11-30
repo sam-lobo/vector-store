@@ -41,48 +41,70 @@ NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 
 def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
     """
-    Calls Nomic Embedding API to generate embeddings.
-    API key must be sent in Authorization header (Bearer).
+    Retrieves embeddings using cache first.
+    Only calls Nomic API for texts not in cache.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
+    global embedding_cache
 
-    body = {"texts": texts}
+    cached_embeddings = []
+    missing_texts = []
+    missing_indices = []
 
-    app.logger.info(f"📡 Sending embedding request to Nomic ({len(texts)} chunks)")
+    # FIRST — check which texts are already cached
+    for i, t in enumerate(texts):
+        if t in embedding_cache:
+            cached_embeddings.append((i, embedding_cache[t]))
+        else:
+            missing_texts.append(t)
+            missing_indices.append(i)
 
-    try:
+    fetched_embeddings = []
+
+    # SECOND — call Nomic ONLY for missing ones
+    if missing_texts:
+        app.logger.info(f"📡 Fetching {len(missing_texts)} new embeddings from Nomic")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        body = {"texts": missing_texts}
+
         response = requests.post(
             NOMIC_URL,
             headers=headers,
             json=body,
             timeout=30
         )
-    except Exception as e:
-        app.logger.error("❌ Request error calling Nomic API:")
-        app.logger.error(str(e))
-        raise
 
-    app.logger.info(f"📥 Nomic Response Status: {response.status_code}")
+        if response.status_code != 200:
+            raise Exception(f"Nomic error: {response.status_code} {response.text}")
 
-    if response.status_code != 200:
-        app.logger.error(f"❌ Nomic API Error Body: {response.text}")
-        raise Exception(f"Nomic API Error: {response.status_code} {response.text}")
+        data = response.json()
 
-    data = response.json()
+        fetched_embeddings = data["embeddings"]
 
-    if "embeddings" not in data:
-        app.logger.error(f"❌ Missing embeddings in Nomic response: {data}")
-        raise Exception("Malformed Nomic API response: no embeddings")
+        # Save fetched ones to cache
+        for idx, emb in zip(missing_indices, fetched_embeddings):
+            embedding_cache[texts[idx]] = np.array(emb, dtype=np.float32)
 
-    embeds = np.array(data["embeddings"], dtype=np.float32)
-    if embeds.ndim == 1:
-        embeds = np.expand_dims(embeds, axis=0)
+        # persist to disk (optional but recommended)
+        save_cache()
 
-    app.logger.info("✅ Embeddings received successfully.")
-    return embeds
+    # THIRD — assemble embeddings in correct order
+    final_embeddings = [None] * len(texts)
+
+    # place cached
+    for idx, emb in cached_embeddings:
+        final_embeddings[idx] = np.array(emb, dtype=np.float32)
+
+    # place fetched
+    for idx, emb in zip(missing_indices, fetched_embeddings):
+        final_embeddings[idx] = np.array(emb, dtype=np.float32)
+
+    return np.vstack(final_embeddings)
+
 
 
 # -----------------------------------
