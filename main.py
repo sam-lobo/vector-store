@@ -13,6 +13,7 @@ import threading
 from typing import List, Optional
 import requests
 import os
+import pickle   # ⭐ ADDED
 
 # -----------------------------------
 # FLASK + LOGGING CONFIGURATION
@@ -20,92 +21,96 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# Logging format
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# rotating file log (works on Render)
 handler = RotatingFileHandler("server.log", maxBytes=1_000_000, backupCount=5)
 handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 app.logger.addHandler(handler)
 
 app.logger.info("🚀 Flask service starting...")
 
+# -----------------------------------
+# EMBEDDING CACHE (SERVER-SIDE)
+# -----------------------------------
+CACHE_FILE = "embedding_cache.pkl"
+
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, "rb") as f:
+        embedding_cache = pickle.load(f)
+else:
+    embedding_cache = {}
+
+def save_cache():
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump(embedding_cache, f)
+
+app.logger.info(f"📚 Cache loaded with {len(embedding_cache)} items")
 
 # -----------------------------------
-# NOMIC CLOUD EMBEDDINGS (CORRECT AUTH)
+# NOMIC CLOUD EMBEDDINGS (WITH CACHE)
 # -----------------------------------
 NOMIC_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 
 def get_cloud_embedding(texts: List[str], api_key: str) -> np.ndarray:
     """
-    Retrieves embeddings using cache first.
-    Only calls Nomic API for texts not in cache.
+    Uses server-side cache to prevent repeated API calls.
+    Only fetches embeddings not already in cache.
     """
     global embedding_cache
 
-    cached_embeddings = []
-    missing_texts = []
-    missing_indices = []
+    cached = []
+    missing = []
+    missing_idx = []
 
-    # FIRST — check which texts are already cached
-    for i, t in enumerate(texts):
-        if t in embedding_cache:
-            cached_embeddings.append((i, embedding_cache[t]))
+    # 1. CHECK CACHE
+    for i, text in enumerate(texts):
+        if text in embedding_cache:
+            cached.append((i, embedding_cache[text]))
         else:
-            missing_texts.append(t)
-            missing_indices.append(i)
+            missing.append(text)
+            missing_idx.append(i)
 
-    fetched_embeddings = []
+    fetched = []
 
-    # SECOND — call Nomic ONLY for missing ones
-    if missing_texts:
-        app.logger.info(f"📡 Fetching {len(missing_texts)} new embeddings from Nomic")
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-
-        body = {"texts": missing_texts}
+    # 2. FETCH ONLY MISSING EMBEDDINGS
+    if missing:
+        app.logger.info(f"📡 Fetching {len(missing)} embeddings from Nomic")
 
         response = requests.post(
             NOMIC_URL,
-            headers=headers,
-            json=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            },
+            json={"texts": missing},
             timeout=30
         )
 
         if response.status_code != 200:
-            raise Exception(f"Nomic error: {response.status_code} {response.text}")
+            raise Exception(response.text)
 
         data = response.json()
+        fetched = data["embeddings"]
 
-        fetched_embeddings = data["embeddings"]
-
-        # Save fetched ones to cache
-        for idx, emb in zip(missing_indices, fetched_embeddings):
+        # SAVE NEW ITEMS TO CACHE
+        for idx, emb in zip(missing_idx, fetched):
             embedding_cache[texts[idx]] = np.array(emb, dtype=np.float32)
 
-        # persist to disk (optional but recommended)
-        save_cache()
+        save_cache()  # persist to disk
 
-    # THIRD — assemble embeddings in correct order
-    final_embeddings = [None] * len(texts)
+    # 3. REBUILD ORDERED ARRAY
+    final = [None] * len(texts)
 
-    # place cached
-    for idx, emb in cached_embeddings:
-        final_embeddings[idx] = np.array(emb, dtype=np.float32)
+    for idx, emb in cached:
+        final[idx] = np.array(emb, dtype=np.float32)
 
-    # place fetched
-    for idx, emb in zip(missing_indices, fetched_embeddings):
-        final_embeddings[idx] = np.array(emb, dtype=np.float32)
+    for idx, emb in zip(missing_idx, fetched):
+        final[idx] = np.array(emb, dtype=np.float32)
 
-    return np.vstack(final_embeddings)
-
-
+    return np.vstack(final)
 
 # -----------------------------------
 # USER SESSION MODELS
@@ -127,12 +132,10 @@ class QueryInput(BaseModel):
 class DeleteSessionInput(BaseModel):
     user_id: str
 
-
 # -----------------------------------
 # TEXT CHUNKING
 # -----------------------------------
 def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]:
-    app.logger.info("✂️ Chunking text...")
     encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
     chunks = []
@@ -143,123 +146,64 @@ def chunk_text(text: str, chunk_size: int = 200, overlap: int = 50) -> List[str]
         chunks.append(encoding.decode(chunk))
         i += chunk_size - overlap
 
-    app.logger.info(f"📦 Total chunks created: {len(chunks)}")
     return chunks
-
 
 # -----------------------------------
 # INITIALIZE VECTOR STORE
 # -----------------------------------
 @app.route('/initialize', methods=['POST'])
 def build_vector_store():
-    try:
-        app.logger.info("📥 /initialize request received")
-        app.logger.info(f"Request JSON: {request.json}")
-
-        payload = TextInput(**request.json)
-    except ValidationError as e:
-        app.logger.error("❌ Validation error in /initialize")
-        return jsonify({'error': e.errors()}), 400
-    except Exception:
-        app.logger.error("❌ Unexpected error in /initialize")
-        app.logger.error(traceback.format_exc())
-        return jsonify({'error': 'Invalid request'}), 400
-
+    payload = TextInput(**request.json)
     user_id = payload.user_id or str(uuid.uuid4())
-    app.logger.info(f"🆔 Creating new session: {user_id}")
 
-    try:
-        text_chunks = chunk_text(payload.text)
+    text_chunks = chunk_text(payload.text)
+    embeddings = get_cloud_embedding(text_chunks, payload.api_key)
 
-        embeddings = get_cloud_embedding(text_chunks, payload.api_key)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
 
-        dim = embeddings.shape[1]
-        index = faiss.IndexFlatL2(dim)
-        index.add(embeddings)
+    user_sessions[user_id] = {
+        "index": index,
+        "chunks": text_chunks,
+        "last_accessed": time.time(),
+    }
 
-        user_sessions[user_id] = {
-            "index": index,
-            "chunks": text_chunks,
-            "last_accessed": time.time(),
-        }
-
-        app.logger.info(f"✅ Session {user_id} initialized successfully.")
-        return jsonify({
-            "status": "success",
-            "user_id": user_id,
-            "chunks_stored": len(text_chunks)
-        })
-
-    except Exception as e:
-        app.logger.error("❌ Error in /initialize:")
-        app.logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
+    return jsonify({"status": "success", "user_id": user_id})
 
 # -----------------------------------
 # QUERY VECTOR STORE
 # -----------------------------------
 @app.route('/query_vector_store', methods=['POST'])
 def query_vector_store():
-    try:
-        app.logger.info("📥 /query_vector_store request received")
-        app.logger.info(f"Request JSON: {request.json}")
-
-        payload = QueryInput(**request.json)
-    except ValidationError as e:
-        app.logger.error("❌ Validation error in query")
-        return jsonify({'error': e.errors()}), 400
-    except Exception:
-        app.logger.error("❌ Unexpected error parsing request")
-        return jsonify({'error': 'Invalid request'}), 400
+    payload = QueryInput(**request.json)
 
     if payload.user_id not in user_sessions:
-        app.logger.warning(f"⚠️ Missing session: {payload.user_id}")
         return jsonify({"error": "User session not found"}), 404
 
     session = user_sessions[payload.user_id]
 
-    try:
-        query_embedding = get_cloud_embedding([payload.query], payload.api_key)[0]
+    query_emb = get_cloud_embedding([payload.query], payload.api_key)[0]
 
-        index = session["index"]
-        chunks = session["chunks"]
+    D, I = session["index"].search(
+        np.array([query_emb], dtype=np.float32),
+        payload.top_k
+    )
 
-        D, I = index.search(
-            np.array([query_embedding], dtype=np.float32),
-            payload.top_k
-        )
+    results = [session["chunks"][idx] for idx in I[0]]
 
-        results = [chunks[idx] for idx in I[0] if idx < len(chunks)]
+    session["last_accessed"] = time.time()
 
-        session["last_accessed"] = time.time()
-
-        app.logger.info(f"🔍 Query success for user {payload.user_id}")
-        return jsonify({"matches": results})
-
-    except Exception as e:
-        app.logger.error("❌ Error in /query_vector_store")
-        app.logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
+    return jsonify({"matches": results})
 
 # -----------------------------------
 # DELETE SESSION
 # -----------------------------------
 @app.route('/delete_session', methods=['POST'])
 def delete_session():
-    try:
-        payload = DeleteSessionInput(**request.json)
-    except:
-        return jsonify({"error": "Invalid request"}), 400
-
-    if payload.user_id in user_sessions:
-        del user_sessions[payload.user_id]
-        app.logger.info(f"🗑️ Deleted session {payload.user_id}")
-        return jsonify({"status": "success"})
-
-    return jsonify({"error": "User session not found"}), 404
-
+    payload = DeleteSessionInput(**request.json)
+    user_sessions.pop(payload.user_id, None)
+    return jsonify({"status": "success"})
 
 # -----------------------------------
 # CLEANUP THREAD
@@ -273,16 +217,13 @@ def cleanup_sessions():
         ]
         for uid in expired:
             del user_sessions[uid]
-            app.logger.info(f"🧹 Auto-deleted expired session {uid}")
         time.sleep(600)
 
 threading.Thread(target=cleanup_sessions, daemon=True).start()
 
-
 # -----------------------------------
-# START FLASK USING RENDER PORT
+# START FLASK SERVER
 # -----------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.logger.info(f"🚀 Starting Flask on port {port}")
     app.run(host="0.0.0.0", port=port)
